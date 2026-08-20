@@ -21,6 +21,9 @@ class ControlAccessibilityService : AccessibilityService() {
         val width = display.widthPixels.toFloat()
         val height = display.heightPixels.toFloat()
         when (message.optString("type")) {
+            "back" -> performGlobalAction(GLOBAL_ACTION_BACK)
+            "home" -> performGlobalAction(GLOBAL_ACTION_HOME)
+            "recents" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
             "tap" -> {
                 val x = (message.optDouble("x", 0.5) * width).toFloat()
                 val y = (message.optDouble("y", 0.5) * height).toFloat()
