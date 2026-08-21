@@ -21,11 +21,10 @@ import org.webrtc.MediaStream
 import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
 import org.webrtc.SdpObserver
-import org.webrtc.SessionDescription
 import org.webrtc.ScreenCapturerAndroid
+import org.webrtc.SessionDescription
 import org.webrtc.SurfaceTextureHelper
 import org.webrtc.VideoTrack
-import java.nio.ByteBuffer
 
 class ScreenCaptureService : Service() {
     companion object {
@@ -44,6 +43,8 @@ class ScreenCaptureService : Service() {
     private var factory: PeerConnectionFactory? = null
     private var eglBase: EglBase? = null
     private var dataChannel: DataChannel? = null
+    private val pendingIceCandidates = mutableListOf<IceCandidate>()
+    private var remoteDescriptionSet = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -57,9 +58,7 @@ class ScreenCaptureService : Service() {
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-        } else {
-            startForeground(1, notification)
-        }
+        } else startForeground(1, notification)
     }
 
     private fun startStreaming(intent: Intent) {
@@ -71,14 +70,9 @@ class ScreenCaptureService : Service() {
         }
         val serverUrl = intent.getStringExtra(EXTRA_SERVER_URL)?.trim().orEmpty()
         val roomCode = intent.getStringExtra(EXTRA_ROOM_CODE)?.trim().orEmpty()
-        if (resultCode < 0 || resultData == null || serverUrl.isBlank() || roomCode.isBlank()) {
-            stopSelf()
-            return
-        }
+        if (resultCode < 0 || resultData == null || serverUrl.isBlank() || roomCode.isBlank()) { stopSelf(); return }
 
-        PeerConnectionFactory.initialize(
-            PeerConnectionFactory.InitializationOptions.builder(this).createInitializationOptions()
-        )
+        PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(this).createInitializationOptions())
         eglBase = EglBase.create()
         factory = PeerConnectionFactory.builder()
             .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase!!.eglBaseContext, true, true))
@@ -91,10 +85,7 @@ class ScreenCaptureService : Service() {
         peerConnection = factory?.createPeerConnection(configuration, peerObserver)
         dataChannel = peerConnection?.createDataChannel("control", DataChannel.Init())
 
-        val projectionIntent = Intent(resultData).apply {
-            putExtra("resultCode", resultCode)
-        }
-        screenCapturer = ScreenCapturerAndroid(projectionIntent, object : MediaProjection.Callback() {
+        screenCapturer = ScreenCapturerAndroid(Intent(resultData), object : MediaProjection.Callback() {
             override fun onStop() { stopSelf() }
         })
         surfaceTextureHelper = SurfaceTextureHelper.create("ScreenCapture", eglBase!!.eglBaseContext)
@@ -112,16 +103,29 @@ class ScreenCaptureService : Service() {
         override fun onPeerJoined() { createOffer() }
         override fun onAnswer(sdp: JSONObject) {
             val type = SessionDescription.Type.fromCanonicalForm(sdp.optString("type")) ?: return
-            peerConnection?.setRemoteDescription(SimpleSdpObserver(), SessionDescription(type, sdp.optString("sdp")))
+            peerConnection?.setRemoteDescription(object : SimpleSdpObserver() {
+                override fun onSetSuccess() {
+                    remoteDescriptionSet = true
+                    pendingIceCandidates.forEach { peerConnection?.addIceCandidate(it) }
+                    pendingIceCandidates.clear()
+                }
+            }, SessionDescription(type, sdp.optString("sdp")))
         }
         override fun onIceCandidate(candidate: JSONObject) {
-            peerConnection?.addIceCandidate(IceCandidate(candidate.optString("sdpMid"), candidate.optInt("sdpMLineIndex"), candidate.optString("candidate")))
+            val ice = IceCandidate(candidate.optString("sdpMid"), candidate.optInt("sdpMLineIndex"), candidate.optString("candidate"))
+            if (!remoteDescriptionSet) pendingIceCandidates += ice else peerConnection?.addIceCandidate(ice)
         }
         override fun onError(message: String) { stopSelf() }
-        override fun onPeerLeft() { peerConnection?.close(); peerConnection = null }
+        override fun onPeerLeft() {
+            peerConnection?.close(); peerConnection = null
+            remoteDescriptionSet = false
+            pendingIceCandidates.clear()
+        }
     }
 
     private fun createOffer() {
+        remoteDescriptionSet = false
+        pendingIceCandidates.clear()
         peerConnection?.createOffer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(description: SessionDescription) {
                 peerConnection?.setLocalDescription(object : SimpleSdpObserver() {
@@ -136,9 +140,7 @@ class ScreenCaptureService : Service() {
     private val peerObserver = object : PeerConnection.Observer {
         override fun onIceCandidate(candidate: IceCandidate) {
             signaling?.sendIceCandidate(JSONObject().apply {
-                put("sdpMid", candidate.sdpMid)
-                put("sdpMLineIndex", candidate.sdpMLineIndex)
-                put("candidate", candidate.sdp)
+                put("sdpMid", candidate.sdpMid); put("sdpMLineIndex", candidate.sdpMLineIndex); put("candidate", candidate.sdp)
             })
         }
         override fun onDataChannel(channel: DataChannel) { registerControlChannel(channel) }
@@ -161,7 +163,7 @@ class ScreenCaptureService : Service() {
             override fun onMessage(buffer: DataChannel.Buffer) {
                 val bytes = ByteArray(buffer.data.remaining())
                 buffer.data.get(bytes)
-                try { ControlAccessibilityService.instance?.handleControl(JSONObject(String(bytes, Charsets.UTF_8))) } catch (_: Exception) {}
+                runCatching { ControlAccessibilityService.instance?.handleControl(JSONObject(String(bytes, Charsets.UTF_8))) }
             }
         })
     }
@@ -181,16 +183,10 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onDestroy() {
-        try { screenCapturer?.stopCapture() } catch (_: Exception) {}
-        screenCapturer?.dispose()
-        surfaceTextureHelper?.dispose()
-        videoSource?.dispose()
-        videoTrack?.dispose()
-        dataChannel?.dispose()
-        peerConnection?.dispose()
-        factory?.dispose()
-        eglBase?.release()
-        signaling?.close()
+        runCatching { screenCapturer?.stopCapture() }
+        screenCapturer?.dispose(); surfaceTextureHelper?.dispose(); videoSource?.dispose(); videoTrack?.dispose()
+        dataChannel?.dispose(); peerConnection?.dispose(); factory?.dispose(); eglBase?.release(); signaling?.close()
+        pendingIceCandidates.clear()
         super.onDestroy()
     }
 
